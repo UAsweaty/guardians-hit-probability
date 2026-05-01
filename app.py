@@ -29,6 +29,12 @@ def get_player_season_stats(person_id: int, season: int):
     params = {"stats": "season", "group": "hitting", "season": season}
     return requests.get(url, params=params, timeout=20).json()
 
+@st.cache_data(ttl=3600)
+def get_team_roster(team_id: int, season: int):
+    url = f"{MLB_API}/teams/{team_id}/roster"
+    params = {"season": season}
+    return requests.get(url, params=params, timeout=20).json()
+
 def extract_ba(stats_json):
     """Return batting average as float if available."""
     try:
@@ -90,7 +96,7 @@ for side in ["home", "away"]:
 df = pd.DataFrame(batters).drop_duplicates(subset=["id"])
 
 if df.empty:
-    st.info("Lineup/boxscore players are not available yet for this game. Try again closer to game time.")
+    st.info("Roster fallback failed (no hitters returned). Try again later.")
     st.stop()
 
 
