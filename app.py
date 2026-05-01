@@ -78,7 +78,6 @@ def weighted_ba(metrics: list[dict]):
 
     weights = []
     values = []
-
     for m in usable:
         ab = m.get("ab") or 0
         full_ab = m.get("full_weight_ab", 20) or 20
@@ -86,7 +85,7 @@ def weighted_ba(metrics: list[dict]):
         if ab and ab > 0:
             sample_factor = min(1.0, ab / full_ab)
         else:
-            sample_factor = 0.25  # if AB missing, give a small contribution
+            sample_factor = 0.25
 
         w = (m.get("weight_base", 0) or 0) * sample_factor
         weights.append(w)
@@ -100,7 +99,6 @@ def weighted_ba(metrics: list[dict]):
     return clamp(p)
 
 def build_breakdown(metrics: list[dict]) -> pd.DataFrame:
-    """Create a user-friendly breakdown table."""
     rows = []
     for m in metrics:
         if m.get("ba") is None:
@@ -127,7 +125,7 @@ def get_schedule(date_str: str):
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
-    # Live feed endpoint (public) [2](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)[5](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)
+    # Live feed endpoint (public) [3](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -139,9 +137,7 @@ def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
 
 @st.cache_data(ttl=3600)
 def get_player_stats(person_id: int, season: int, stats_type: str, group: str = "hitting", extra_params: dict | None = None):
-    """
-    Pull a statType for a player (season, lastXGames, homeAndAway, etc.). [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[4](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
-    """
+    # Stat types like lastXGames/homeAndAway exist in the API [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[5](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
     url = f"{MLB_API}/people/{person_id}/stats"
     params = {"stats": stats_type, "group": group, "season": season}
     if extra_params:
@@ -152,8 +148,6 @@ def get_player_stats(person_id: int, season: int, stats_type: str, group: str = 
 def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     """
     Bulk batter-vs-pitcher using /people + hydrate=stats(... type=[vsPlayer], opposingPlayerId=...).
-    This uses the vsPlayer stat type and opposingPlayerId approach. [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
-    Returns dict: batter_id -> stat dict (or None).
     """
     if not batter_ids or not pitcher_id:
         return {}
@@ -182,7 +176,7 @@ def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     return out
 
 # -----------------------------
-# UI - Date/Game
+# UI - Date/Game (use SCHEDULE as source of truth for names/IDs)
 # -----------------------------
 picked_date = st.date_input("Pick a date", value=dt.date.today())
 date_str = picked_date.strftime("%Y-%m-%d")
@@ -198,26 +192,28 @@ if not dates or not dates[0].get("games"):
 game = dates[0]["games"][0]
 game_pk = game["gamePk"]
 
-feed = get_game_feed(game_pk)
+# Pull team names/ids from schedule game object (reliable even when live feed shows "Away/Home")
+sched_home = game.get("teams", {}).get("home", {}).get("team", {})
+sched_away = game.get("teams", {}).get("away", {}).get("team", {})
+home_name = sched_home.get("name", "Home")
+away_name = sched_away.get("name", "Away")
+home_id = sched_home.get("id")
+away_id = sched_away.get("id")
 
-teams = feed.get("gameData", {}).get("teams", {})
-home_team = teams.get("home", {})
-away_team = teams.get("away", {})
-
-home_name = home_team.get("name", "Home")
-away_name = away_team.get("name", "Away")
-home_id = home_team.get("id")
-away_id = away_team.get("id")
-
+# Determine if Guardians are home/away and opponent name
 guardians_side = "home" if home_id == GUARDIANS_TEAM_ID else "away"
 is_home_game = guardians_side == "home"
 opponent_id = away_id if is_home_game else home_id
 opponent_name = away_name if is_home_game else home_name
 
-# opponent side relative to guardians
-opponent_side = "home" if not is_home_game else "away"
+# Add the clear "who are they playing" display at the top
+matchup_text = f"Cleveland Guardians vs {opponent_name}" if is_home_game else f"Cleveland Guardians @ {opponent_name}"
+st.markdown(f"### 🆚 {matchup_text}")
 
-c1, c2, c3, c4 = st.columns(4)
+# Pull live feed for probable pitchers / live context
+feed = get_game_feed(game_pk)
+
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     st.metric("gamePk", game_pk)
 with c2:
@@ -226,6 +222,8 @@ with c3:
     st.metric("Guardians", "Home" if is_home_game else "Away")
 with c4:
     st.metric("Opponent", opponent_name)
+with c5:
+    st.metric("Venue", game.get("venue", {}).get("name", "Unknown"))
 
 st.subheader("Matchup")
 st.write(f"**{away_name} @ {home_name}**")
@@ -235,8 +233,11 @@ st.write(f"**{away_name} @ {home_name}**")
 # -----------------------------
 st.subheader("Opponent Pitcher")
 
-# probablePitchers appears in gameData when available [5](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)[2](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
+# probablePitchers appears in live feed gameData when available [2](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)[3](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
 probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
+
+# opponent side relative to guardians
+opponent_side = "away" if is_home_game else "home"
 opp_probable = probables.get(opponent_side)
 
 opp_pitcher_id = None
@@ -254,6 +255,7 @@ else:
 if not use_probable:
     pitchers = []
 
+    # Try active roster first, then fullSeason
     opp_roster_json = get_team_roster(opponent_id, season, roster_type="active")
     opp_roster = opp_roster_json.get("roster", [])
     if len(opp_roster) == 0:
@@ -276,9 +278,6 @@ if not use_probable:
         chosen = st.selectbox("Select opponent pitcher", [p[0] for p in pitchers])
         opp_pitcher_name = chosen
         opp_pitcher_id = [p[1] for p in pitchers if p[0] == chosen][0]
-
-# If using probable, keep the probable IDs
-# (If probable existed and checkbox is true, opp_pitcher_id/name already set.)
 
 # -----------------------------
 # Guardians hitters (from roster)
@@ -329,12 +328,12 @@ with st.spinner("Calculating hitter probabilities..."):
         season_stat = extract_first_stat(season_stats)
         season_ba, season_ab, season_h = ba_from_stat(season_stat)
 
-        # Last 10 games BA (supported stat type lastXGames) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[4](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
+        # Last 10 games BA (most important) [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[5](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
         last10_stats = get_player_stats(pid, season, stats_type="lastXGames", group="hitting", extra_params={"limit": 10})
         last10_stat = extract_first_stat(last10_stats)
         last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
 
-        # Home/Away split BA (supported stat type homeAndAway) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+        # Home/Away split BA (least important) [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
         ha_stats = get_player_stats(pid, season, stats_type="homeAndAway", group="hitting")
         ha_splits = extract_splits(ha_stats)
 
@@ -350,11 +349,11 @@ with st.spinner("Calculating hitter probabilities..."):
         ha_pick = home_stat if is_home_game else away_stat
         ha_ba, ha_ab, ha_h = ba_from_stat(ha_pick)
 
-        # BvP stat dict (supported via vsPlayer / opposingPlayerId) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+        # BvP
         bvp_stat = bvp_map.get(pid) if opp_pitcher_id else None
         bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
 
-        # Weighting: Last10 > Pitcher > Home/Away, Season is small stabilizer
+        # Weighting: Last10 > Pitcher > Home/Away, Season stabilizer
         metrics = [
             {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
              "weight_base": 0.10, "full_weight_ab": 120},
@@ -409,7 +408,7 @@ else:
             use_container_width=True
         )
 
-st.caption("Tip: Click 🔄 Refresh data after lineups/probables update to recalculate with the newest API data.")
+st.caption("Tip: Click 🔄 Refresh data after probables/lineups update to recalculate with the newest API data.")
 
 # -----------------------------
 # Optional: Single hitter details + breakdown
@@ -419,7 +418,6 @@ st.subheader("🔎 Hitter Details (optional)")
 selected_name = st.selectbox("Select a hitter to view the breakdown", [h[0] for h in hitters])
 selected_id = [h[1] for h in hitters if h[0] == selected_name][0]
 
-# Pull stats (cached, so quick)
 season_stats = get_player_stats(selected_id, season, stats_type="season", group="hitting")
 season_stat = extract_first_stat(season_stats)
 season_ba, season_ab, season_h = ba_from_stat(season_stat)
@@ -449,10 +447,8 @@ bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
 metrics_detail = [
     {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
      "weight_base": 0.10, "full_weight_ab": 120},
-
     {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
      "weight_base": 0.60, "full_weight_ab": 20},
-
     {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
      "weight_base": 0.15, "full_weight_ab": 60},
 ]
@@ -464,7 +460,6 @@ if opp_pitcher_id:
     })
 
 p_hit_detail = weighted_ba(metrics_detail)
-
 if p_hit_detail is not None:
     st.metric("Estimated P(hit) for selected hitter", f"{p_hit_detail:.3f}")
 
