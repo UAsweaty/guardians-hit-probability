@@ -22,6 +22,21 @@ with top_right:
     st.caption(f"Last refreshed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # -----------------------------
+# Team logo helpers (SVG rendered via HTML)
+# -----------------------------
+def team_logo_url(team_id: int) -> str:
+    # MLB-hosted SVG cap logos
+    return f"https://www.mlbstatic.com/team-logos/team-cap-on-dark/{team_id}.svg"
+
+def logo_html(team_id: int, size: int = 64) -> str:
+    url = team_logo_url(team_id)
+    return f"""
+    <div style="display:flex;align-items:center;justify-content:center;">
+        <img src="{url}" width="{size}" height="{size}" style="object-fit:contain;" />
+    </div>
+    """
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def safe_float(x):
@@ -118,14 +133,12 @@ def build_breakdown(metrics: list[dict]) -> pd.DataFrame:
 # -----------------------------
 @st.cache_data(ttl=600)
 def get_schedule(date_str: str):
-    # Schedule endpoint (public) [1](https://docs.statsapi.mlb.com/)
     url = f"{MLB_API}/schedule"
     params = {"sportId": 1, "date": date_str, "teamId": GUARDIANS_TEAM_ID}
     return requests.get(url, params=params, timeout=20).json()
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
-    # Live feed endpoint (public) [3](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -137,7 +150,6 @@ def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
 
 @st.cache_data(ttl=3600)
 def get_player_stats(person_id: int, season: int, stats_type: str, group: str = "hitting", extra_params: dict | None = None):
-    # Stat types like lastXGames/homeAndAway exist in the API [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[5](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
     url = f"{MLB_API}/people/{person_id}/stats"
     params = {"stats": stats_type, "group": group, "season": season}
     if extra_params:
@@ -148,6 +160,7 @@ def get_player_stats(person_id: int, season: int, stats_type: str, group: str = 
 def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     """
     Bulk batter-vs-pitcher using /people + hydrate=stats(... type=[vsPlayer], opposingPlayerId=...).
+    Returns dict: batter_id -> stat dict (or None).
     """
     if not batter_ids or not pitcher_id:
         return {}
@@ -176,7 +189,7 @@ def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     return out
 
 # -----------------------------
-# UI - Date/Game (use SCHEDULE as source of truth for names/IDs)
+# UI - Date/Game (Schedule is source of truth for opponent/team names)
 # -----------------------------
 picked_date = st.date_input("Pick a date", value=dt.date.today())
 date_str = picked_date.strftime("%Y-%m-%d")
@@ -192,7 +205,7 @@ if not dates or not dates[0].get("games"):
 game = dates[0]["games"][0]
 game_pk = game["gamePk"]
 
-# Pull team names/ids from schedule game object (reliable even when live feed shows "Away/Home")
+# Team names/IDs from schedule are reliable
 sched_home = game.get("teams", {}).get("home", {}).get("team", {})
 sched_away = game.get("teams", {}).get("away", {}).get("team", {})
 home_name = sched_home.get("name", "Home")
@@ -200,17 +213,28 @@ away_name = sched_away.get("name", "Away")
 home_id = sched_home.get("id")
 away_id = sched_away.get("id")
 
-# Determine if Guardians are home/away and opponent name
 guardians_side = "home" if home_id == GUARDIANS_TEAM_ID else "away"
 is_home_game = guardians_side == "home"
 opponent_id = away_id if is_home_game else home_id
 opponent_name = away_name if is_home_game else home_name
 
-# Add the clear "who are they playing" display at the top
+# Matchup text
 matchup_text = f"Cleveland Guardians vs {opponent_name}" if is_home_game else f"Cleveland Guardians @ {opponent_name}"
-st.markdown(f"### 🆚 {matchup_text}")
 
-# Pull live feed for probable pitchers / live context
+# --- Matchup line WITH LOGOS ---
+logo_left, mid, logo_right = st.columns([1, 6, 1], vertical_alignment="center")
+with logo_left:
+    st.markdown(logo_html(GUARDIANS_TEAM_ID, size=70), unsafe_allow_html=True)
+with mid:
+    st.markdown(f"### 🆚 {matchup_text}")
+with logo_right:
+    # opponent logo
+    if opponent_id:
+        st.markdown(logo_html(int(opponent_id), size=70), unsafe_allow_html=True)
+    else:
+        st.write("")
+
+# Live feed (probable pitchers / context)
 feed = get_game_feed(game_pk)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -233,7 +257,6 @@ st.write(f"**{away_name} @ {home_name}**")
 # -----------------------------
 st.subheader("Opponent Pitcher")
 
-# probablePitchers appears in live feed gameData when available [2](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)[3](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
 probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
 
 # opponent side relative to guardians
@@ -255,7 +278,6 @@ else:
 if not use_probable:
     pitchers = []
 
-    # Try active roster first, then fullSeason
     opp_roster_json = get_team_roster(opponent_id, season, roster_type="active")
     opp_roster = opp_roster_json.get("roster", [])
     if len(opp_roster) == 0:
@@ -328,12 +350,12 @@ with st.spinner("Calculating hitter probabilities..."):
         season_stat = extract_first_stat(season_stats)
         season_ba, season_ab, season_h = ba_from_stat(season_stat)
 
-        # Last 10 games BA (most important) [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[5](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
+        # Last 10 games BA (most important)
         last10_stats = get_player_stats(pid, season, stats_type="lastXGames", group="hitting", extra_params={"limit": 10})
         last10_stat = extract_first_stat(last10_stats)
         last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
 
-        # Home/Away split BA (least important) [4](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+        # Home/Away split BA (least important)
         ha_stats = get_player_stats(pid, season, stats_type="homeAndAway", group="hitting")
         ha_splits = extract_splits(ha_stats)
 
@@ -378,9 +400,7 @@ with st.spinner("Calculating hitter probabilities..."):
             "Hitter": name,
             "P(hit)": p_hit,
             "Last10 BA": last10_ba,
-            "Last10 AB": last10_ab,
             "VsPitcher BA": bvp_ba,
-            "VsPitcher AB": bvp_ab,
             "Home/Away BA": ha_ba,
             "Season BA": season_ba
         })
@@ -393,20 +413,14 @@ if rank_df.empty:
 else:
     top5 = rank_df.head(5).copy()
     top5["P(hit)"] = top5["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-    st.dataframe(
-        top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]],
-        use_container_width=True
-    )
+    st.dataframe(top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
 
     show_more = st.checkbox("Show Top 15 / more hitters", value=False)
     if show_more:
         show_n = st.slider("How many hitters to show?", 5, min(30, len(rank_df)), min(15, len(rank_df)))
         show_df = rank_df.head(show_n).copy()
         show_df["P(hit)"] = show_df["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-        st.dataframe(
-            show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]],
-            use_container_width=True
-        )
+        st.dataframe(show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
 
 st.caption("Tip: Click 🔄 Refresh data after probables/lineups update to recalculate with the newest API data.")
 
