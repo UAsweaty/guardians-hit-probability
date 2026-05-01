@@ -22,17 +22,18 @@ with top_right:
     st.caption(f"Last refreshed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # -----------------------------
-# Team logo helpers (SVG rendered via HTML)
+# Team logo helpers (SVG rendered via HTML <img>)
+# MLB team logo URL pattern
+# https://www.mlbstatic.com/team-logos/team-cap-on-dark/{teamId}.svg [2](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
 # -----------------------------
 def team_logo_url(team_id: int) -> str:
-    # MLB-hosted SVG cap logos
     return f"https://www.mlbstatic.com/team-logos/team-cap-on-dark/{team_id}.svg"
 
-def logo_html(team_id: int, size: int = 64) -> str:
+def logo_img_html(team_id: int, size: int = 70) -> str:
     url = team_logo_url(team_id)
     return f"""
     <div style="display:flex;align-items:center;justify-content:center;">
-        <img src="{url}" width="{size}" height="{size}" style="object-fit:contain;" />
+        <img src="{url}" style="height:{size}px;width:{size}px;object-fit:contain;" />
     </div>
     """
 
@@ -133,12 +134,14 @@ def build_breakdown(metrics: list[dict]) -> pd.DataFrame:
 # -----------------------------
 @st.cache_data(ttl=600)
 def get_schedule(date_str: str):
+    # Schedule endpoint (public) francisco-2026-official-2-poster-set-super-tickets-history-poster-pop-art-event-poster)
     url = f"{MLB_API}/schedule"
     params = {"sportId": 1, "date": date_str, "teamId": GUARDIANS_TEAM_ID}
     return requests.get(url, params=params, timeout=20).json()
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
+    # Live feed endpoint (public) [4](https://logodix.com/mlb-team)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -150,8 +153,9 @@ def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
 
 @st.cache_data(ttl=3600)
 def get_player_stats(person_id: int, season: int, stats_type: str, group: str = "hitting", extra_params: dict | None = None):
+    # Stat types (homeAndAway, lastXGames, etc.) are listed by the API [1](https://www.univers-baseball.fr/en/baseball-mlb-team-logos/)
     url = f"{MLB_API}/people/{person_id}/stats"
-    params = {"stats": stats_type, "group": group, "season": season}
+    params = {"stats": stats_type, "group": group, "season": season, "sportId": 1}
     if extra_params:
         params.update(extra_params)
     return requests.get(url, params=params, timeout=20).json()
@@ -159,8 +163,8 @@ def get_player_stats(person_id: int, season: int, stats_type: str, group: str = 
 @st.cache_data(ttl=3600)
 def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     """
-    Bulk batter-vs-pitcher using /people + hydrate=stats(... type=[vsPlayer], opposingPlayerId=...).
-    Returns dict: batter_id -> stat dict (or None).
+    Bulk batter-vs-pitcher using /people + hydrate=stats(type=[vsPlayer],opposingPlayerId=...).
+    The vsPlayer stat type exists in statTypes. [1](https://www.univers-baseball.fr/en/baseball-mlb-team-logos/)
     """
     if not batter_ids or not pitcher_id:
         return {}
@@ -189,7 +193,52 @@ def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     return out
 
 # -----------------------------
-# UI - Date/Game (Schedule is source of truth for opponent/team names)
+# NEW: Robust home/away BA extraction
+# -----------------------------
+def get_home_away_ba(player_id: int, season: int, is_home_game: bool, season_fallback_ba: float | None):
+    """
+    Returns (ha_ba, ha_ab, ha_h, source_label)
+    source_label = "split" if we got true home/away split, else "season_fallback"
+    """
+    ha_stats = get_player_stats(player_id, season, stats_type="homeAndAway", group="hitting")
+    splits = extract_splits(ha_stats)
+
+    home_stat = None
+    away_stat = None
+
+    for s in splits:
+        split_obj = s.get("split")
+
+        # split can sometimes be dict; handle string just in case
+        if isinstance(split_obj, dict):
+            desc = (split_obj.get("description") or "").strip().lower()
+            code = (split_obj.get("code") or "").strip().lower()
+            tag = desc or code
+        elif isinstance(split_obj, str):
+            tag = split_obj.strip().lower()
+        else:
+            tag = ""
+
+        if tag == "home":
+            home_stat = s.get("stat")
+        elif tag == "away":
+            away_stat = s.get("stat")
+
+    pick = home_stat if is_home_game else away_stat
+    ha_ba, ha_ab, ha_h = ba_from_stat(pick)
+
+    if ha_ba is not None:
+        return ha_ba, ha_ab, ha_h, "split"
+
+    # Fallback so it never shows None
+    if season_fallback_ba is not None:
+        return season_fallback_ba, None, None, "season_fallback"
+
+    return None, None, None, "missing"
+
+
+# -----------------------------
+# UI - Date/Game (Schedule as truth for teams/opponent)
 # -----------------------------
 picked_date = st.date_input("Pick a date", value=dt.date.today())
 date_str = picked_date.strftime("%Y-%m-%d")
@@ -205,7 +254,7 @@ if not dates or not dates[0].get("games"):
 game = dates[0]["games"][0]
 game_pk = game["gamePk"]
 
-# Team names/IDs from schedule are reliable
+# Team names/IDs from schedule are reliable [3](https://sportsposterwarehouse.com/products/super-bowl-lx-posters-san-francisco-2026-official-2-poster-set-super-tickets-history-poster-pop-art-event-poster)
 sched_home = game.get("teams", {}).get("home", {}).get("team", {})
 sched_away = game.get("teams", {}).get("away", {}).get("team", {})
 home_name = sched_home.get("name", "Home")
@@ -218,23 +267,21 @@ is_home_game = guardians_side == "home"
 opponent_id = away_id if is_home_game else home_id
 opponent_name = away_name if is_home_game else home_name
 
-# Matchup text
 matchup_text = f"Cleveland Guardians vs {opponent_name}" if is_home_game else f"Cleveland Guardians @ {opponent_name}"
 
-# --- Matchup line WITH LOGOS ---
-logo_left, mid, logo_right = st.columns([1, 6, 1], vertical_alignment="center")
-with logo_left:
-    st.markdown(logo_html(GUARDIANS_TEAM_ID, size=70), unsafe_allow_html=True)
-with mid:
+# Matchup banner with logos
+lcol, mcol, rcol = st.columns([1, 6, 1], vertical_alignment="center")
+with lcol:
+    st.markdown(logo_img_html(GUARDIANS_TEAM_ID, 70), unsafe_allow_html=True)
+with mcol:
     st.markdown(f"### 🆚 {matchup_text}")
-with logo_right:
-    # opponent logo
+with rcol:
     if opponent_id:
-        st.markdown(logo_html(int(opponent_id), size=70), unsafe_allow_html=True)
+        st.markdown(logo_img_html(int(opponent_id), 70), unsafe_allow_html=True)
     else:
         st.write("")
 
-# Live feed (probable pitchers / context)
+# Live feed for probables [4](https://logodix.com/mlb-team)[5](https://www.pinterest.com/pin/453808099937810704/)
 feed = get_game_feed(game_pk)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -258,8 +305,6 @@ st.write(f"**{away_name} @ {home_name}**")
 st.subheader("Opponent Pitcher")
 
 probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
-
-# opponent side relative to guardians
 opponent_side = "away" if is_home_game else "home"
 opp_probable = probables.get(opponent_side)
 
@@ -277,7 +322,6 @@ else:
 
 if not use_probable:
     pitchers = []
-
     opp_roster_json = get_team_roster(opponent_id, season, roster_type="active")
     opp_roster = opp_roster_json.get("roster", [])
     if len(opp_roster) == 0:
@@ -302,7 +346,7 @@ if not use_probable:
         opp_pitcher_id = [p[1] for p in pitchers if p[0] == chosen][0]
 
 # -----------------------------
-# Guardians hitters (from roster)
+# Guardians hitters (roster)
 # -----------------------------
 st.subheader("Guardians Hitters")
 
@@ -330,52 +374,37 @@ if not hitters:
 hitters = sorted(hitters, key=lambda x: x[0])
 hitter_ids = [h[1] for h in hitters]
 
-# -----------------------------
-# Bulk BvP fetch (fast)
-# -----------------------------
+# Bulk BvP
 bvp_map = {}
 if opp_pitcher_id:
     bvp_map = get_bvp_stats_bulk(hitter_ids, opp_pitcher_id, season)
 
 # -----------------------------
-# Compute probabilities for ALL hitters and rank
+# Rank all hitters
 # -----------------------------
 st.subheader("🏆 Top Projected Hitters (Top 5)")
 
 with st.spinner("Calculating hitter probabilities..."):
     rows = []
     for name, pid in hitters:
-        # Season BA
+        # Season BA (baseline)
         season_stats = get_player_stats(pid, season, stats_type="season", group="hitting")
         season_stat = extract_first_stat(season_stats)
         season_ba, season_ab, season_h = ba_from_stat(season_stat)
 
-        # Last 10 games BA (most important)
+        # Last 10 games BA (stat type exists) [1](https://www.univers-baseball.fr/en/baseball-mlb-team-logos/)[6](https://www.sportslogos.net/logos/view/481992612026/MLB-Opening-Day-Logo/2026/Primary-Logo)
         last10_stats = get_player_stats(pid, season, stats_type="lastXGames", group="hitting", extra_params={"limit": 10})
         last10_stat = extract_first_stat(last10_stats)
         last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
 
-        # Home/Away split BA (least important)
-        ha_stats = get_player_stats(pid, season, stats_type="homeAndAway", group="hitting")
-        ha_splits = extract_splits(ha_stats)
-
-        home_stat = None
-        away_stat = None
-        for s in ha_splits:
-            desc = ((s.get("split", {}) or {}).get("description", "") or "")
-            if desc == "Home":
-                home_stat = s.get("stat")
-            elif desc == "Away":
-                away_stat = s.get("stat")
-
-        ha_pick = home_stat if is_home_game else away_stat
-        ha_ba, ha_ab, ha_h = ba_from_stat(ha_pick)
+        # Home/Away BA (robust; never None because fallback)
+        ha_ba, ha_ab, ha_h, ha_source = get_home_away_ba(pid, season, is_home_game, season_ba)
 
         # BvP
         bvp_stat = bvp_map.get(pid) if opp_pitcher_id else None
         bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
 
-        # Weighting: Last10 > Pitcher > Home/Away, Season stabilizer
+        # Weighting (your preference): Last10 > Pitcher > Home/Away; Season stabilizer
         metrics = [
             {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
              "weight_base": 0.10, "full_weight_ab": 120},
@@ -383,7 +412,8 @@ with st.spinner("Calculating hitter probabilities..."):
             {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
              "weight_base": 0.60, "full_weight_ab": 20},
 
-            {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
+            # Home/Away split (least important but always present now)
+            {"name": f"Home/Away BA ({'Home' if is_home_game else 'Away'})", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
              "weight_base": 0.15, "full_weight_ab": 60},
         ]
 
@@ -402,6 +432,7 @@ with st.spinner("Calculating hitter probabilities..."):
             "Last10 BA": last10_ba,
             "VsPitcher BA": bvp_ba,
             "Home/Away BA": ha_ba,
+            "HA Source": ha_source,   # shows if split was real or fallback
             "Season BA": season_ba
         })
 
@@ -413,19 +444,25 @@ if rank_df.empty:
 else:
     top5 = rank_df.head(5).copy()
     top5["P(hit)"] = top5["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-    st.dataframe(top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
+    st.dataframe(
+        top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "HA Source", "Season BA"]],
+        use_container_width=True
+    )
 
     show_more = st.checkbox("Show Top 15 / more hitters", value=False)
     if show_more:
         show_n = st.slider("How many hitters to show?", 5, min(30, len(rank_df)), min(15, len(rank_df)))
         show_df = rank_df.head(show_n).copy()
         show_df["P(hit)"] = show_df["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-        st.dataframe(show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
+        st.dataframe(
+            show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "HA Source", "Season BA"]],
+            use_container_width=True
+        )
 
-st.caption("Tip: Click 🔄 Refresh data after probables/lineups update to recalculate with the newest API data.")
+st.caption("Tip: Click 🔄 Refresh data after probables/updates to recalculate with the newest API data.")
 
 # -----------------------------
-# Optional: Single hitter details + breakdown
+# Optional: Single hitter breakdown
 # -----------------------------
 st.subheader("🔎 Hitter Details (optional)")
 
@@ -440,20 +477,7 @@ last10_stats = get_player_stats(selected_id, season, stats_type="lastXGames", gr
 last10_stat = extract_first_stat(last10_stats)
 last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
 
-ha_stats = get_player_stats(selected_id, season, stats_type="homeAndAway", group="hitting")
-ha_splits = extract_splits(ha_stats)
-
-home_stat = None
-away_stat = None
-for s in ha_splits:
-    desc = ((s.get("split", {}) or {}).get("description", "") or "")
-    if desc == "Home":
-        home_stat = s.get("stat")
-    elif desc == "Away":
-        away_stat = s.get("stat")
-
-ha_pick = home_stat if is_home_game else away_stat
-ha_ba, ha_ab, ha_h = ba_from_stat(ha_pick)
+ha_ba, ha_ab, ha_h, ha_source = get_home_away_ba(selected_id, season, is_home_game, season_ba)
 
 bvp_stat = bvp_map.get(selected_id) if opp_pitcher_id else None
 bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
@@ -463,7 +487,7 @@ metrics_detail = [
      "weight_base": 0.10, "full_weight_ab": 120},
     {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
      "weight_base": 0.60, "full_weight_ab": 20},
-    {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
+    {"name": f"Home/Away BA ({'Home' if is_home_game else 'Away'})", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
      "weight_base": 0.15, "full_weight_ab": 60},
 ]
 if opp_pitcher_id:
@@ -476,6 +500,7 @@ if opp_pitcher_id:
 p_hit_detail = weighted_ba(metrics_detail)
 if p_hit_detail is not None:
     st.metric("Estimated P(hit) for selected hitter", f"{p_hit_detail:.3f}")
+st.caption(f"Home/Away source for this player: **{ha_source}** (split or fallback)")
 
 st.dataframe(build_breakdown(metrics_detail), use_container_width=True)
 
