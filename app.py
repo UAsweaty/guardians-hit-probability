@@ -12,14 +12,12 @@ st.caption("Starter model: uses season batting average (BA) as a rough per-AB hi
 
 @st.cache_data(ttl=600)
 def get_schedule(date_str: str):
-    # Schedule endpoint example documented publicly by MLB Stats API community docs. [1](https://openpublicapis.com/api/mlb-records-and-stats)
     url = f"{MLB_API}/schedule"
     params = {"sportId": 1, "date": date_str, "teamId": GUARDIANS_TEAM_ID}
     return requests.get(url, params=params, timeout=20).json()
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
-    # Live feed endpoint is a standard Stats API endpoint for play-by-play and game data. [2](https://github.com/toddrob99/MLB-StatsAPI/wiki/Endpoints)[1](https://openpublicapis.com/api/mlb-records-and-stats)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -29,13 +27,11 @@ def get_player_season_stats(person_id: int, season: int):
     params = {"stats": "season", "group": "hitting", "season": season}
     return requests.get(url, params=params, timeout=20).json()
 
-
 @st.cache_data(ttl=3600)
 def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
     url = f"{MLB_API}/teams/{team_id}/roster"
     params = {"season": season, "rosterType": roster_type}
     return requests.get(url, params=params, timeout=20).json()
-
 
 def extract_ba(stats_json):
     """Return batting average as float if available."""
@@ -51,9 +47,10 @@ def extract_ba(stats_json):
     except Exception:
         return None, None
 
-# --- UI ---
-today = st.date_input("Pick a date", value=dt.date.today())
-date_str = today.strftime("%Y-%m-%d")
+# ---------------- UI ----------------
+picked_date = st.date_input("Pick a date", value=dt.date.today())
+date_str = picked_date.strftime("%Y-%m-%d")
+season = picked_date.year
 
 schedule = get_schedule(date_str)
 dates = schedule.get("dates", [])
@@ -81,7 +78,16 @@ home = teams.get("home", {}).get("name", "Home")
 away = teams.get("away", {}).get("name", "Away")
 st.write(f"**{away} @ {home}**")
 
-# Try to list batters from boxscore (often available close to game time)
+# Determine which side is Guardians (home/away) when the feed provides IDs
+home_id = teams.get("home", {}).get("id")
+away_id = teams.get("away", {}).get("id")
+guardians_side = None
+if home_id == GUARDIANS_TEAM_ID:
+    guardians_side = "home"
+elif away_id == GUARDIANS_TEAM_ID:
+    guardians_side = "away"
+
+# ---------------- Players from boxscore (game-time) ----------------
 boxscore = feed.get("liveData", {}).get("boxscore", {})
 batters = []
 
@@ -97,17 +103,15 @@ for side in ["home", "away"]:
 
 df = pd.DataFrame(batters).drop_duplicates(subset=["id"])
 
-# ---------- PREGAME FALLBACK ----------
+# ---------------- PREGAME FALLBACK: use Guardians roster ----------------
 if df.empty:
     st.info("Lineup/boxscore isn't available yet. Using the Guardians roster instead (pregame fallback).")
-
-    season = today.year
 
     # Try ACTIVE roster first (best pregame option)
     roster_json = get_team_roster(GUARDIANS_TEAM_ID, season, roster_type="active")
     roster = roster_json.get("roster", [])
 
-    # If ACTIVE roster is empty, try fullSeason (sometimes needed)
+    # If ACTIVE roster is empty, try fullSeason
     if len(roster) == 0:
         roster_json = get_team_roster(GUARDIANS_TEAM_ID, season, roster_type="fullSeason")
         roster = roster_json.get("roster", [])
@@ -116,11 +120,11 @@ if df.empty:
 
     roster_rows = []
     for r in roster:
-        person = r.get("person", {}) or {}
+        person = (r.get("person", {}) or {})
         pid = person.get("id")
         name = person.get("fullName")
 
-        position = r.get("position", {}) or {}
+        position = (r.get("position", {}) or {})
         pos_abbr = position.get("abbreviation", "")
         pos_name = position.get("name", "")
 
@@ -134,7 +138,7 @@ if df.empty:
 
     df = pd.DataFrame(roster_rows).drop_duplicates(subset=["id"])
 
-    # Filter out pitchers SAFELY (keeps hitters)
+    # Filter out pitchers safely (keeps hitters)
     if not df.empty and "pos" in df.columns:
         df = df[~df["pos"].astype(str).str.contains(r"(^P$|Pitcher)", case=False, na=False)]
 
@@ -143,7 +147,37 @@ if df.empty:
         with st.expander("Debug roster JSON (helps us fix instantly)"):
             st.json(roster_json)
         st.stop()
-# ---------- END FALLBACK ----------
 
+# ---------------- Player selection UI ----------------
+st.subheader("Pick a player")
 
+show_team = st.selectbox("Which players to show?", ["Guardians only", "Both teams"], index=0)
 
+if show_team == "Guardians only":
+    # If we used roster fallback, side is literally "guardians"
+    if "guardians" in df["side"].unique():
+        df_show = df[df["side"] == "guardians"].copy()
+    else:
+        # If we have game boxscore data, use home/away side
+        if guardians_side is None:
+            # Safety fallback if team IDs aren't available for some reason
+            df_show = df.copy()
+        else:
+            df_show = df[df["side"] == guardians_side].copy()
+else:
+    df_show = df.copy()
+
+df_show = df_show.dropna(subset=["name", "id"])
+
+if df_show.empty:
+    st.warning("No players available to show for this selection.")
+    st.stop()
+
+player_name = st.selectbox("Select a batter", sorted(df_show["name"].unique()))
+player_id = int(df_show[df_show["name"] == player_name]["id"].iloc[0])
+
+# ---------------- Probability ----------------
+stats_json = get_player_season_stats(player_id, season)
+ba, raw = extract_ba(stats_json)
+
+st.subheader("Estimated Hit Probability (starter)")
