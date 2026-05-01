@@ -90,3 +90,7 @@ for side in ["home", "away"]:
 df = pd.DataFrame(batters).drop_duplicates(subset=["id"])
 
 if df.empty:
+    st.info("Lineup/boxscore players are not available yet for this game. Try again closer to game time.")
+    st.stop()
+
+
