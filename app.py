@@ -29,11 +29,13 @@ def get_player_season_stats(person_id: int, season: int):
     params = {"stats": "season", "group": "hitting", "season": season}
     return requests.get(url, params=params, timeout=20).json()
 
+
 @st.cache_data(ttl=3600)
-def get_team_roster(team_id: int, season: int):
+def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
     url = f"{MLB_API}/teams/{team_id}/roster"
-    params = {"season": season}
+    params = {"season": season, "rosterType": roster_type}
     return requests.get(url, params=params, timeout=20).json()
+
 
 def extract_ba(stats_json):
     """Return batting average as float if available."""
@@ -95,8 +97,53 @@ for side in ["home", "away"]:
 
 df = pd.DataFrame(batters).drop_duplicates(subset=["id"])
 
+# ---------- PREGAME FALLBACK ----------
 if df.empty:
-    st.info("Roster fallback failed (no hitters returned). Try again later.")
-    st.stop()
+    st.info("Lineup/boxscore isn't available yet. Using the Guardians roster instead (pregame fallback).")
+
+    season = today.year
+
+    # Try ACTIVE roster first (best pregame option)
+    roster_json = get_team_roster(GUARDIANS_TEAM_ID, season, roster_type="active")
+    roster = roster_json.get("roster", [])
+
+    # If ACTIVE roster is empty, try fullSeason (sometimes needed)
+    if len(roster) == 0:
+        roster_json = get_team_roster(GUARDIANS_TEAM_ID, season, roster_type="fullSeason")
+        roster = roster_json.get("roster", [])
+
+    st.caption(f"Roster rows returned: {len(roster)}")
+
+    roster_rows = []
+    for r in roster:
+        person = r.get("person", {}) or {}
+        pid = person.get("id")
+        name = person.get("fullName")
+
+        position = r.get("position", {}) or {}
+        pos_abbr = position.get("abbreviation", "")
+        pos_name = position.get("name", "")
+
+        if pid and name:
+            roster_rows.append({
+                "side": "guardians",
+                "name": name,
+                "id": pid,
+                "pos": pos_abbr or pos_name
+            })
+
+    df = pd.DataFrame(roster_rows).drop_duplicates(subset=["id"])
+
+    # Filter out pitchers SAFELY (keeps hitters)
+    if not df.empty and "pos" in df.columns:
+        df = df[~df["pos"].astype(str).str.contains(r"(^P$|Pitcher)", case=False, na=False)]
+
+    if df.empty:
+        st.error("Roster fallback failed (no players returned after filtering).")
+        with st.expander("Debug roster JSON (helps us fix instantly)"):
+            st.json(roster_json)
+        st.stop()
+# ---------- END FALLBACK ----------
+
 
 
