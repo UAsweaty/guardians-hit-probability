@@ -7,8 +7,19 @@ MLB_API = "https://statsapi.mlb.com/api/v1"
 GUARDIANS_TEAM_ID = 114  # Cleveland Guardians
 
 st.set_page_config(page_title="Guardians Hit Probability", page_icon="⚾", layout="wide")
-st.title("⚾ Cleveland Guardians — Hit Probability (v3)")
+st.title("⚾ Cleveland Guardians — Hit Probability")
 st.caption("Guardians hitters only • Weighted: Last 10 games (most) → vs pitcher → home/away (least).")
+
+# -----------------------------
+# Refresh button (clears cache + reruns)
+# -----------------------------
+top_left, top_right = st.columns([1, 3])
+with top_left:
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
+with top_right:
+    st.caption(f"Last refreshed: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # -----------------------------
 # Helpers
@@ -67,6 +78,7 @@ def weighted_ba(metrics: list[dict]):
 
     weights = []
     values = []
+
     for m in usable:
         ab = m.get("ab") or 0
         full_ab = m.get("full_weight_ab", 20) or 20
@@ -74,7 +86,7 @@ def weighted_ba(metrics: list[dict]):
         if ab and ab > 0:
             sample_factor = min(1.0, ab / full_ab)
         else:
-            sample_factor = 0.25  # if AB missing, small contribution
+            sample_factor = 0.25  # if AB missing, give a small contribution
 
         w = (m.get("weight_base", 0) or 0) * sample_factor
         weights.append(w)
@@ -87,17 +99,35 @@ def weighted_ba(metrics: list[dict]):
     p = sum(v * w for v, w in zip(values, weights)) / total_w
     return clamp(p)
 
+def build_breakdown(metrics: list[dict]) -> pd.DataFrame:
+    """Create a user-friendly breakdown table."""
+    rows = []
+    for m in metrics:
+        if m.get("ba") is None:
+            continue
+        rows.append({
+            "Metric": m.get("name"),
+            "BA": m.get("ba"),
+            "AB": m.get("ab"),
+            "Hits": m.get("h"),
+            "Base Weight": m.get("weight_base"),
+            "FullWeightAB": m.get("full_weight_ab")
+        })
+    return pd.DataFrame(rows)
+
 # -----------------------------
 # API Calls (cached)
 # -----------------------------
 @st.cache_data(ttl=600)
 def get_schedule(date_str: str):
+    # Schedule endpoint (public) [1](https://docs.statsapi.mlb.com/)
     url = f"{MLB_API}/schedule"
     params = {"sportId": 1, "date": date_str, "teamId": GUARDIANS_TEAM_ID}
     return requests.get(url, params=params, timeout=20).json()
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
+    # Live feed endpoint (public) [2](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)[5](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -109,6 +139,9 @@ def get_team_roster(team_id: int, season: int, roster_type: str = "active"):
 
 @st.cache_data(ttl=3600)
 def get_player_stats(person_id: int, season: int, stats_type: str, group: str = "hitting", extra_params: dict | None = None):
+    """
+    Pull a statType for a player (season, lastXGames, homeAndAway, etc.). [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[4](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
+    """
     url = f"{MLB_API}/people/{person_id}/stats"
     params = {"stats": stats_type, "group": group, "season": season}
     if extra_params:
@@ -118,13 +151,13 @@ def get_player_stats(person_id: int, season: int, stats_type: str, group: str = 
 @st.cache_data(ttl=3600)
 def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
     """
-    Bulk batter-vs-pitcher using /people with personIds + hydrate=stats(... type=[vsPlayer] opposingPlayerId=...)
-    Returns dict: batter_id -> stat dict (or None)
+    Bulk batter-vs-pitcher using /people + hydrate=stats(... type=[vsPlayer], opposingPlayerId=...).
+    This uses the vsPlayer stat type and opposingPlayerId approach. [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+    Returns dict: batter_id -> stat dict (or None).
     """
     if not batter_ids or not pitcher_id:
         return {}
 
-    # MLB API accepts comma-separated personIds
     url = f"{MLB_API}/people"
     ids_str = ",".join(str(i) for i in batter_ids)
 
@@ -145,8 +178,8 @@ def get_bvp_stats_bulk(batter_ids: list[int], pitcher_id: int, season: int):
             stat_dict = None
         if pid:
             out[int(pid)] = stat_dict
-    return out
 
+    return out
 
 # -----------------------------
 # UI - Date/Game
@@ -180,6 +213,8 @@ guardians_side = "home" if home_id == GUARDIANS_TEAM_ID else "away"
 is_home_game = guardians_side == "home"
 opponent_id = away_id if is_home_game else home_id
 opponent_name = away_name if is_home_game else home_name
+
+# opponent side relative to guardians
 opponent_side = "home" if not is_home_game else "away"
 
 c1, c2, c3, c4 = st.columns(4)
@@ -200,6 +235,7 @@ st.write(f"**{away_name} @ {home_name}**")
 # -----------------------------
 st.subheader("Opponent Pitcher")
 
+# probablePitchers appears in gameData when available [5](https://forum.choiceofgames.com/t/what-if-opposing-stats-actually-used-two-variables/94933)[2](https://github.com/toddrob99/MLB-StatsAPI/blob/master/statsapi/endpoints.py)
 probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
 opp_probable = probables.get(opponent_side)
 
@@ -230,10 +266,10 @@ if not use_probable:
         name = person.get("fullName")
         pos = ((r.get("position", {}) or {}).get("abbreviation", "") or "")
         if pid and name and pos == "P":
-            pitchers.append((name, pid))
+            pitchers.append((name, int(pid)))
 
     if not pitchers:
-        st.warning("Could not load opponent pitchers right now.")
+        st.warning("Could not load opponent pitchers right now. (BvP will be skipped.)")
         opp_pitcher_id = None
         opp_pitcher_name = None
     else:
@@ -241,9 +277,11 @@ if not use_probable:
         opp_pitcher_name = chosen
         opp_pitcher_id = [p[1] for p in pitchers if p[0] == chosen][0]
 
+# If using probable, keep the probable IDs
+# (If probable existed and checkbox is true, opp_pitcher_id/name already set.)
 
 # -----------------------------
-# Guardians hitters only (from roster)
+# Guardians hitters (from roster)
 # -----------------------------
 st.subheader("Guardians Hitters")
 
@@ -268,110 +306,120 @@ if not hitters:
         st.json(g_roster_json)
     st.stop()
 
-# Sort hitters alphabetically for the dropdown
 hitters = sorted(hitters, key=lambda x: x[0])
 hitter_ids = [h[1] for h in hitters]
 
-# Pre-fetch BvP stats in one call (fast)
+# -----------------------------
+# Bulk BvP fetch (fast)
+# -----------------------------
 bvp_map = {}
 if opp_pitcher_id:
     bvp_map = get_bvp_stats_bulk(hitter_ids, opp_pitcher_id, season)
 
 # -----------------------------
-# Compute ranking for all hitters
-# -----------------------------
-rows = []
-for name, pid in hitters:
-    # Season BA
-    season_stats = get_player_stats(pid, season, stats_type="season", group="hitting")
-    season_stat = extract_first_stat(season_stats)
-    season_ba, season_ab, season_h = ba_from_stat(season_stat)
-
-    # Last 10 games BA (BA-based)
-    last10_stats = get_player_stats(pid, season, stats_type="lastXGames", group="hitting", extra_params={"limit": 10})
-    last10_stat = extract_first_stat(last10_stats)
-    last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
-
-    # Home/Away split BA
-    ha_stats = get_player_stats(pid, season, stats_type="homeAndAway", group="hitting")
-    ha_splits = extract_splits(ha_stats)
-
-    home_stat = None
-    away_stat = None
-    for s in ha_splits:
-        desc = ((s.get("split", {}) or {}).get("description", "") or "")
-        if desc == "Home":
-            home_stat = s.get("stat")
-        elif desc == "Away":
-            away_stat = s.get("stat")
-
-    ha_pick = home_stat if is_home_game else away_stat
-    ha_ba, ha_ab, ha_h = ba_from_stat(ha_pick)
-
-    # BvP
-    bvp_stat = bvp_map.get(pid) if opp_pitcher_id else None
-    bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
-
-    # Weights: Last10 (most) -> Pitcher -> Home/Away (least). Season is small stabilizer.
-    metrics = [
-        {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
-         "weight_base": 0.10, "full_weight_ab": 120},
-
-        {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
-         "weight_base": 0.60, "full_weight_ab": 20},
-
-        {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
-         "weight_base": 0.15, "full_weight_ab": 60},
-    ]
-
-    if opp_pitcher_id:
-        metrics.append({"name": "Vs Pitcher BA", "ba": bvp_ba, "ab": bvp_ab, "h": bvp_h,
-                        "weight_base": 0.40, "full_weight_ab": 25})
-
-    p_hit = weighted_ba(metrics)
-
-    rows.append({
-        "Hitter": name,
-        "P(hit)": p_hit,
-        "Last10 BA": last10_ba,
-        "Last10 AB": last10_ab,
-        "VsPitcher BA": bvp_ba,
-        "VsPitcher AB": bvp_ab,
-        "Home/Away BA": ha_ba,
-        "Season BA": season_ba
-    })
-
-rank_df = pd.DataFrame(rows)
-
-# Clean + sort
-rank_df = rank_df.dropna(subset=["P(hit)"]).sort_values("P(hit)", ascending=False).reset_index(drop=True)
-
-# -----------------------------
-# Top 5 output
+# Compute probabilities for ALL hitters and rank
 # -----------------------------
 st.subheader("🏆 Top Projected Hitters (Top 5)")
+
+with st.spinner("Calculating hitter probabilities..."):
+    rows = []
+    for name, pid in hitters:
+        # Season BA
+        season_stats = get_player_stats(pid, season, stats_type="season", group="hitting")
+        season_stat = extract_first_stat(season_stats)
+        season_ba, season_ab, season_h = ba_from_stat(season_stat)
+
+        # Last 10 games BA (supported stat type lastXGames) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)[4](https://developer.sportradar.com/baseball/docs/mlb-ig-retrieving-statistics)
+        last10_stats = get_player_stats(pid, season, stats_type="lastXGames", group="hitting", extra_params={"limit": 10})
+        last10_stat = extract_first_stat(last10_stats)
+        last10_ba, last10_ab, last10_h = ba_from_stat(last10_stat)
+
+        # Home/Away split BA (supported stat type homeAndAway) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+        ha_stats = get_player_stats(pid, season, stats_type="homeAndAway", group="hitting")
+        ha_splits = extract_splits(ha_stats)
+
+        home_stat = None
+        away_stat = None
+        for s in ha_splits:
+            desc = ((s.get("split", {}) or {}).get("description", "") or "")
+            if desc == "Home":
+                home_stat = s.get("stat")
+            elif desc == "Away":
+                away_stat = s.get("stat")
+
+        ha_pick = home_stat if is_home_game else away_stat
+        ha_ba, ha_ab, ha_h = ba_from_stat(ha_pick)
+
+        # BvP stat dict (supported via vsPlayer / opposingPlayerId) [3](https://github.com/streamlit/docs/blob/main/content/deploy/community-cloud/get-started/quickstart.md)
+        bvp_stat = bvp_map.get(pid) if opp_pitcher_id else None
+        bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
+
+        # Weighting: Last10 > Pitcher > Home/Away, Season is small stabilizer
+        metrics = [
+            {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
+             "weight_base": 0.10, "full_weight_ab": 120},
+
+            {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
+             "weight_base": 0.60, "full_weight_ab": 20},
+
+            {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
+             "weight_base": 0.15, "full_weight_ab": 60},
+        ]
+
+        if opp_pitcher_id:
+            metrics.append({
+                "name": f"Vs Pitcher BA ({opp_pitcher_name})",
+                "ba": bvp_ba, "ab": bvp_ab, "h": bvp_h,
+                "weight_base": 0.40, "full_weight_ab": 25
+            })
+
+        p_hit = weighted_ba(metrics)
+
+        rows.append({
+            "Hitter": name,
+            "P(hit)": p_hit,
+            "Last10 BA": last10_ba,
+            "Last10 AB": last10_ab,
+            "VsPitcher BA": bvp_ba,
+            "VsPitcher AB": bvp_ab,
+            "Home/Away BA": ha_ba,
+            "Season BA": season_ba
+        })
+
+rank_df = pd.DataFrame(rows)
+rank_df = rank_df.dropna(subset=["P(hit)"]).sort_values("P(hit)", ascending=False).reset_index(drop=True)
+
 if rank_df.empty:
     st.warning("Not enough data to rank hitters yet.")
 else:
     top5 = rank_df.head(5).copy()
     top5["P(hit)"] = top5["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-    st.dataframe(top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
+    st.dataframe(
+        top5[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]],
+        use_container_width=True
+    )
 
-    show_more = st.checkbox("Show Top 15 / Full list", value=False)
+    show_more = st.checkbox("Show Top 15 / more hitters", value=False)
     if show_more:
-        show_n = st.slider("How many hitters to show?", min_value=5, max_value=min(30, len(rank_df)), value=min(15, len(rank_df)))
+        show_n = st.slider("How many hitters to show?", 5, min(30, len(rank_df)), min(15, len(rank_df)))
         show_df = rank_df.head(show_n).copy()
         show_df["P(hit)"] = show_df["P(hit)"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-        st.dataframe(show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]], use_container_width=True)
+        st.dataframe(
+            show_df[["Hitter", "P(hit)", "Last10 BA", "VsPitcher BA", "Home/Away BA", "Season BA"]],
+            use_container_width=True
+        )
+
+st.caption("Tip: Click 🔄 Refresh data after lineups/probables update to recalculate with the newest API data.")
 
 # -----------------------------
-# Optional: Select a hitter for details
+# Optional: Single hitter details + breakdown
 # -----------------------------
 st.subheader("🔎 Hitter Details (optional)")
-selected_name = st.selectbox("Select a hitter to view details", [h[0] for h in hitters])
+
+selected_name = st.selectbox("Select a hitter to view the breakdown", [h[0] for h in hitters])
 selected_id = [h[1] for h in hitters if h[0] == selected_name][0]
 
-# Pull stats again for the selected hitter (fast due to cache)
+# Pull stats (cached, so quick)
 season_stats = get_player_stats(selected_id, season, stats_type="season", group="hitting")
 season_stat = extract_first_stat(season_stats)
 season_ba, season_ab, season_h = ba_from_stat(season_stat)
@@ -399,13 +447,29 @@ bvp_stat = bvp_map.get(selected_id) if opp_pitcher_id else None
 bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
 
 metrics_detail = [
-    {"Metric": "Season BA", "BA": season_ba, "AB": season_ab, "Hits": season_h},
-    {"Metric": "Last 10 Games BA", "BA": last10_ba, "AB": last10_ab, "Hits": last10_h},
-    {"Metric": "Home/Away Split BA", "BA": ha_ba, "AB": ha_ab, "Hits": ha_h},
+    {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
+     "weight_base": 0.10, "full_weight_ab": 120},
+
+    {"name": "Last 10 Games BA", "ba": last10_ba, "ab": last10_ab, "h": last10_h,
+     "weight_base": 0.60, "full_weight_ab": 20},
+
+    {"name": "Home/Away Split BA", "ba": ha_ba, "ab": ha_ab, "h": ha_h,
+     "weight_base": 0.15, "full_weight_ab": 60},
 ]
 if opp_pitcher_id:
-    metrics_detail.append({"Metric": f"Vs Pitcher BA ({opp_pitcher_name})", "BA": bvp_ba, "AB": bvp_ab, "Hits": bvp_h})
+    metrics_detail.append({
+        "name": f"Vs Pitcher BA ({opp_pitcher_name})",
+        "ba": bvp_ba, "ab": bvp_ab, "h": bvp_h,
+        "weight_base": 0.40, "full_weight_ab": 25
+    })
 
-st.dataframe(pd.DataFrame(metrics_detail), use_container_width=True)
+p_hit_detail = weighted_ba(metrics_detail)
 
-st.caption("Note: BvP influence is automatically reduced when AB vs pitcher is small.")
+if p_hit_detail is not None:
+    st.metric("Estimated P(hit) for selected hitter", f"{p_hit_detail:.3f}")
+
+st.dataframe(build_breakdown(metrics_detail), use_container_width=True)
+
+with st.expander("Debug details"):
+    st.write(f"Opponent pitcher: {opp_pitcher_name} (ID: {opp_pitcher_id})")
+    st.write(f"Guardians are {'HOME' if is_home_game else 'AWAY'}")
