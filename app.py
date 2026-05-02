@@ -30,7 +30,9 @@ expected_ab = st.sidebar.slider("Expected at-bats (AB) per hitter", min_value=2,
 st.sidebar.caption("Used to convert per-AB probability into game-level probabilities (1+ hits, 2+ hits).")
 
 # -----------------------------
-# Team logo helpers (SVG rendered via HTML <img>)
+# Team logo helpers (SVG via HTML <img>)
+# MLB team logo URL pattern:
+# https://www.mlbstatic.com/team-logos/team-cap-on-dark/{teamId}.svg [5](https://openpublicapis.com/api/mlb-records-and-stats)
 # -----------------------------
 def team_logo_url(team_id: int) -> str:
     return f"https://www.mlbstatic.com/team-logos/team-cap-on-dark/{team_id}.svg"
@@ -39,7 +41,7 @@ def logo_img_html(team_id: int, size: int = 70) -> str:
     url = team_logo_url(team_id)
     return f"""
     <div style="display:flex;align-items:center;justify-content:center;">
-        <img src="{url}" width="{size}" height="{size}" style="object-fit:contain;" />
+        <img src="{url}" width="{size}" />
     </div>
     """
 
@@ -84,15 +86,6 @@ def ba_from_stat(stat: dict):
 def weighted_ba(metrics: list[dict]):
     """
     Combine BA-like metrics into one per-AB probability (p).
-
-    Each metric:
-      {
-        name, ba, ab, h,
-        weight_base,     # importance
-        full_weight_ab   # AB needed for full weight
-      }
-
-    sample_factor = min(1, ab / full_weight_ab)
     """
     usable = [m for m in metrics if m.get("ba") is not None]
     if not usable:
@@ -141,8 +134,6 @@ def prob_1plus_hits(p_per_ab: float, n_ab: int) -> float:
 
 def prob_2plus_hits(p_per_ab: float, n_ab: int) -> float:
     # P(X >= 2) = 1 - [P(0) + P(1)]
-    # P(0) = (1-p)^n
-    # P(1) = n*p*(1-p)^(n-1)
     p0 = (1.0 - p_per_ab) ** n_ab
     p1 = n_ab * p_per_ab * (1.0 - p_per_ab) ** (n_ab - 1)
     return max(0.0, 1.0 - (p0 + p1))
@@ -152,12 +143,23 @@ def prob_2plus_hits(p_per_ab: float, n_ab: int) -> float:
 # -----------------------------
 @st.cache_data(ttl=600)
 def get_schedule(date_str: str):
+    """
+    Use schedule hydration to get probable pitchers earlier:
+    hydrate=team,probablePitcher(note)
+    This can return teams.home/away.probablePitcher objects. [3](https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-04-26&hydrate=probablePitcher%28note%29,team,linescore)[4](https://github.com/pseudo-r/Public-MLB-API/blob/main/docs/schedule.md)
+    """
     url = f"{MLB_API}/schedule"
-    params = {"sportId": 1, "date": date_str, "teamId": GUARDIANS_TEAM_ID}
+    params = {
+        "sportId": 1,
+        "date": date_str,
+        "teamId": GUARDIANS_TEAM_ID,
+        "hydrate": "team,probablePitcher(note)"
+    }
     return requests.get(url, params=params, timeout=20).json()
 
 @st.cache_data(ttl=600)
 def get_game_feed(game_pk: int):
+    # Live feed endpoint (public) [1](https://github.com/toddrob99/MLB-StatsAPI/wiki/Endpoints)
     url = f"{MLB_API}/game/{game_pk}/feed/live"
     return requests.get(url, timeout=20).json()
 
@@ -232,11 +234,44 @@ def get_home_away_ba(player_id: int, season: int, is_home_game: bool, season_fal
     if ha_ba is not None:
         return ha_ba, ha_ab, ha_h
 
-    # fallback so we never show None
     return season_fallback_ba, None, None
 
 # -----------------------------
-# UI - Date/Game (Schedule as truth)
+# NEW: Expected starter logic (Schedule first, then Live Feed, then manual)
+# -----------------------------
+def get_opponent_starter_from_schedule(schedule_game: dict, is_home_game: bool):
+    """
+    From schedule endpoint hydration, probablePitcher may appear at:
+      game['teams']['home']['probablePitcher'] and ['away']['probablePitcher'] [3](https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-04-26&hydrate=probablePitcher%28note%29,team,linescore)[4](https://github.com/pseudo-r/Public-MLB-API/blob/main/docs/schedule.md)
+    Opponent is away when Guardians are home; opponent is home when Guardians are away.
+    """
+    teams = schedule_game.get("teams", {})
+    home_obj = teams.get("home", {}) or {}
+    away_obj = teams.get("away", {}) or {}
+
+    opponent_obj = away_obj if is_home_game else home_obj
+    pp = opponent_obj.get("probablePitcher") or {}
+
+    pid = pp.get("id")
+    name = pp.get("fullName")
+    note = opponent_obj.get("pitcherNote")  # sometimes present with probablePitcher(note)
+    return pid, name, note
+
+def get_opponent_starter_from_live_feed(feed: dict, is_home_game: bool):
+    """
+    Live feed may include gameData.probablePitchers, but it can be blank pregame. [2](https://www.pinterest.com/pin/625226360789608600/)[1](https://github.com/toddrob99/MLB-StatsAPI/wiki/Endpoints)
+    Opponent is away when Guardians are home; opponent is home when Guardians are away.
+    """
+    probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
+    opponent_side = "away" if is_home_game else "home"
+    pp = probables.get(opponent_side)
+
+    if isinstance(pp, dict):
+        return pp.get("id"), pp.get("fullName")
+    return None, None
+
+# -----------------------------
+# UI - Date/Game
 # -----------------------------
 picked_date = st.date_input("Pick a date", value=dt.date.today())
 date_str = picked_date.strftime("%Y-%m-%d")
@@ -278,6 +313,7 @@ with rcol:
     else:
         st.write("")
 
+# Live feed for extra info (still useful)
 feed = get_game_feed(game_pk)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -296,27 +332,40 @@ st.subheader("Matchup")
 st.write(f"**{away_name} @ {home_name}**")
 
 # -----------------------------
-# Pitcher selection (probable or manual)
+# Pitcher selection (AUTO expected starter first)
 # -----------------------------
 st.subheader("Opponent Pitcher")
 
-probables = (feed.get("gameData", {}) or {}).get("probablePitchers", {}) or {}
-opponent_side = "away" if is_home_game else "home"
-opp_probable = probables.get(opponent_side)
+# 1) Best: schedule hydration probablePitcher(note) (pregame reliable) [3](https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-04-26&hydrate=probablePitcher%28note%29,team,linescore)[4](https://github.com/pseudo-r/Public-MLB-API/blob/main/docs/schedule.md)
+sched_pid, sched_name, sched_note = get_opponent_starter_from_schedule(game, is_home_game)
 
 opp_pitcher_id = None
 opp_pitcher_name = None
-if isinstance(opp_probable, dict):
-    opp_pitcher_id = opp_probable.get("id")
-    opp_pitcher_name = opp_probable.get("fullName")
+starter_source = None
 
-use_probable = False
-if opp_pitcher_id and opp_pitcher_name:
-    use_probable = st.checkbox(f"Use probable pitcher: {opp_pitcher_name}", value=True)
+if sched_pid and sched_name:
+    opp_pitcher_id = sched_pid
+    opp_pitcher_name = sched_name
+    starter_source = "Schedule (expected starter)"
 else:
-    st.info("Probable pitcher not available yet. Pick a pitcher manually.")
+    # 2) fallback: live feed probablePitchers (sometimes blank pregame) [2](https://www.pinterest.com/pin/625226360789608600/)[1](https://github.com/toddrob99/MLB-StatsAPI/wiki/Endpoints)
+    live_pid, live_name = get_opponent_starter_from_live_feed(feed, is_home_game)
+    if live_pid and live_name:
+        opp_pitcher_id = live_pid
+        opp_pitcher_name = live_name
+        starter_source = "Live Feed (probablePitchers)"
 
-if not use_probable:
+if opp_pitcher_id and opp_pitcher_name:
+    st.success(f"Expected starter: **{opp_pitcher_name}**  \nSource: {starter_source}")
+    if sched_note:
+        st.caption(f"Pitcher note: {sched_note}")
+    use_auto = st.checkbox("Use this expected starter for matchup stats (recommended)", value=True)
+else:
+    use_auto = False
+    st.info("Expected starter not available from MLB yet. You can select a pitcher manually below.")
+
+# If user unchecks, fall back to manual selection
+if (not opp_pitcher_id) or (not use_auto):
     pitchers = []
     opp_roster_json = get_team_roster(opponent_id, season, roster_type="active")
     opp_roster = opp_roster_json.get("roster", [])
@@ -401,7 +450,6 @@ with st.spinner("Calculating hitter probabilities..."):
         bvp_stat = bvp_map.get(pid) if opp_pitcher_id else None
         bvp_ba, bvp_ab, bvp_h = ba_from_stat(bvp_stat)
 
-        # Per-AB model (p_per_ab)
         metrics = [
             {"name": "Season BA", "ba": season_ba, "ab": season_ab, "h": season_h,
              "weight_base": 0.10, "full_weight_ab": 120},
@@ -418,7 +466,6 @@ with st.spinner("Calculating hitter probabilities..."):
             })
 
         p_per_ab = weighted_ba(metrics)
-
         if p_per_ab is None:
             continue
 
@@ -442,8 +489,6 @@ if rank_df.empty:
     st.warning("Not enough data to rank hitters yet.")
 else:
     top5 = rank_df.head(5).copy()
-
-    # Format probabilities as percentages for easier reading
     top5["P(≥1 hit)"] = top5["P(≥1 hit)"].map(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "")
     top5["P(≥2 hits)"] = top5["P(≥2 hits)"].map(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "")
 
@@ -463,7 +508,7 @@ else:
             use_container_width=True
         )
 
-st.caption("Tip: Click 🔄 Refresh data after probables/updates to recalculate with the newest API data.")
+st.caption("Tip: Click 🔄 Refresh data after probables/updates to recalculate with the newest MLB API data.")
 
 # -----------------------------
 # Optional: Single hitter details + breakdown
@@ -505,8 +550,12 @@ if p_per_ab is not None:
     p1 = prob_1plus_hits(p_per_ab, expected_ab)
     p2 = prob_2plus_hits(p_per_ab, expected_ab)
 
-    st.metric("P(≥1 hit) in game", f"{p1*100:.1f}%")
-    st.metric("P(≥2 hits) in game", f"{p2*100:.1f}%")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.metric("P(≥1 hit) in game", f"{p1*100:.1f}%")
+    with d2:
+        st.metric("P(≥2 hits) in game", f"{p2*100:.1f}%")
+
     st.caption(f"Based on Expected AB = {expected_ab} and the per-AB estimate from the model.")
 
 st.dataframe(build_breakdown(metrics_detail), use_container_width=True)
